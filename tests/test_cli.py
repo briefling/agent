@@ -36,8 +36,17 @@ FAKE = textwrap.dedent('''\
             sys.exit(0 if st.get("logged_in") else 1)
         elif args[0] == "run":
             st["logged_in"] = True; save()
-        elif args[:2] == ["policy", "ls"]:
-            print("\\n".join(st.get("rules", [])))
+        elif args[:2] == ["policy", "ls"]:  # like sbx 0.54: the resources only with --wide
+            if "--wide" in args:
+                print("NAME  TYPE  DECISION  RESOURCES  RULE_ID")
+                for i, x in enumerate(st.get("rules", [])):
+                    print(f"p{{i}}  network  allow  {{x}}  id{{i}}")
+            else:
+                print("default  network  allow  198 hosts")
+        elif args[:3] == ["policy", "rm", "network"]:
+            assert "--force" in args and "--sandbox" in args  # sbx 0.54: the sandbox is no longer positional
+            res = args[args.index("--resource") + 1]
+            st["rules"] = [x for x in st.get("rules", []) if x != res]; save()
         elif args[:2] == ["policy", "allow"]:
             st.setdefault("rules", []).append(args[-1]); save()
     elif tool == "uv":
@@ -146,8 +155,9 @@ def test_init_does_every_step_once(fakes, capsys, monkeypatch):
     assert ["uv", "tool", "install", "--force", "--python", ">=3.11",
             f"git+https://github.com/briefling/acp-bridge@v{cli.BRIDGE_MIN}"] in fakes.calls("uv")
     sbx = fakes.calls("sbx")
-    assert ["sbx", "create", "--name", "briefling-claude", "--kit", "sbx/claude-acp:latest",
-            "--kit", "sbx/claude-sessions:1.0.0", "claude", ws] in sbx
+    hist = os.path.join(cli.agent_dir("claude"), "claude-history")
+    assert ["sbx", "create", "--name", "briefling-claude", "--mount", f"{hist}:/home/agent/claude-history",
+            "--kit", "sbx/claude-acp:latest", "--kit", "sbx/claude-sessions:1.0.0", "claude", ws] in sbx
     assert ["sbx", "run", "--name", "briefling-claude"] in sbx  # the /login step
     assert ["sbx", "policy", "allow", "network", "--sandbox", "briefling-claude", f"localhost:{port}"] in sbx
     assert not any(c[1:3] == ["policy", "allow"] and "--sandbox" not in c for c in sbx)  # never a global rule
@@ -244,6 +254,77 @@ def test_bad_name(fakes, capsys):
     assert cli.main(["init", "claude", LINK, "--name", "Bad Name"]) == 1
     assert cli.main(["init", "claude", LINK, "--port", "80"]) == 1
     assert fakes.calls() == []
+
+
+def test_skills_dir_is_mounted_read_write(fakes, capsys, monkeypatch, tmp_path):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+    skills = tmp_path / "agent-skills"
+    assert cli.main(["init", "claude", LINK, "--skills-dir", str(skills)]) == 0, capsys.readouterr().err
+    ws = json.load(open(cli.conf_path("claude")))["workspace"]
+    create = next(c for c in fakes.calls("sbx") if c[1] == "create")
+    # sbx's shared store off (read-only, seen by every sandbox), the folder over the agent's skills
+    hist = os.path.join(cli.agent_dir("claude"), "claude-history")
+    assert create == ["sbx", "create", "--name", "briefling-claude", "--mount", f"{hist}:/home/agent/claude-history",
+                      "--skills", "off", "--kit", "sbx/claude-acp:latest",
+                      "--kit", "sbx/claude-sessions:1.0.0", "claude", ws, f"{skills}:/home/agent/.claude/skills"]
+    assert skills.is_dir() and "(its skills, read and written)" in capsys.readouterr().out
+    # kept on a run again; another folder needs a new sandbox (a mount is set at creation)
+    assert cli.main(["init", "claude"]) == 0
+    assert json.load(open(cli.conf_path("claude")))["skills_dir"] == str(skills)
+    assert cli.main(["init", "claude", "--skills-dir", str(tmp_path / "other")]) == 1
+    assert "sbx rm briefling-claude" in capsys.readouterr().err
+    assert sum(1 for c in fakes.calls("sbx") if c[1] == "create") == 1
+
+
+def test_each_agent_has_its_own_history(fakes, monkeypatch):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+    assert cli.main(["init", "claude", LINK]) == 0
+    assert cli.main(["init", "claude", LINK, "--name", "other"]) == 0
+    mounts = [c[c.index("--mount") + 1] for c in fakes.calls("sbx") if c[1] == "create"]
+    hosts = [m.rsplit(":", 1)[0] for m in mounts]
+    assert len(set(hosts)) == 2 and all(m.endswith(":/home/agent/claude-history") for m in mounts)
+    for h in hosts:
+        assert os.path.isdir(h) and os.stat(h).st_mode & 0o077 == 0
+
+
+def test_an_old_sandbox_is_flagged(fakes, capsys, monkeypatch):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+    assert cli.main(["init", "claude", LINK]) == 0
+    conf = cli.load_conf("claude")
+    del conf["history_dir"]  # as made by 0.1.0
+    cli.save_conf(conf)
+    capsys.readouterr()
+    assert cli.main(["init", "claude"]) == 0
+    assert "WARNING: made without a history folder of its own" in capsys.readouterr().out
+
+
+def test_no_skills_dir_keeps_sbx_default(fakes, monkeypatch, tmp_path):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+    assert cli.main(["init", "claude", LINK]) == 0
+    create = next(c for c in fakes.calls("sbx") if c[1] == "create")
+    assert "--skills" not in create
+    assert cli.main(["init", "claude", "--skills-dir", str(tmp_path / "s")]) == 1  # sandbox made without it
+
+
+def test_launchd_start_waits_for_bootout_and_retries(tmp_path, monkeypatch):
+    calls, answers = [], {"print": [0, 0, 1], "bootstrap": [5, 0]}
+
+    def fake(argv):
+        calls.append(argv[1])
+        seq = answers.get(argv[1])
+        return (seq.pop(0) if seq else 0), ("Bootstrap failed: 5: Input/output error" if argv[1] == "bootstrap" else "")
+    monkeypatch.setattr(service, "_run", fake)
+    monkeypatch.setattr(service.time, "sleep", lambda s: None)
+    assert service.Launchd("claude", str(tmp_path)).start() is None
+    assert calls == ["enable", "bootout", "print", "print", "print", "bootstrap", "bootstrap"]
+    answers["bootstrap"] = [5, 5, 5]
+    calls.clear()
+    assert "Input/output error" in service.Launchd("claude", str(tmp_path)).start()
+    assert calls.count("bootstrap") == service.BOOTSTRAP_TRIES
 
 
 def test_launchd_plist(tmp_path):

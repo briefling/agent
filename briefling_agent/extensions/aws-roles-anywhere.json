@@ -1,0 +1,56 @@
+{
+  "name": "aws-roles-anywhere",
+  "summary": "AWS for the agent without a stored key: a certificate on this machine, 1-hour credentials in the sandbox (IAM Roles Anywhere), a read-only role and a deploy role",
+  "requires": {
+    "aws": "AWS CLI v2, signed in with admin rights on the target account (used once, here, never in the sandbox): https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html",
+    "openssl": "openssl (macOS and Linux ship one)",
+    "curl": "curl"
+  },
+  "args": [
+    {"flag": "--profile", "dest": "profile", "required": true,
+     "help": "AWS CLI profile with admin rights on the target account, used here to set it up (not given to the agent)"},
+    {"flag": "--region", "dest": "region", "required": true, "fixed": true, "help": "AWS region of the agent's work, e.g. us-east-1"},
+    {"flag": "--prefix", "dest": "prefix", "default": "briefling-agent-", "fixed": true,
+     "help": "prefix of the AWS resources' names (default briefling-agent-)"},
+    {"flag": "--tag", "dest": "tags", "multiple": true, "help": "extra tag KEY=VALUE on the AWS resources (repeatable)"},
+    {"flag": "--toolkit-stack", "dest": "toolkit_stack", "default": "CDKToolkit", "fixed": true,
+     "help": "CDK bootstrap stack to fix for the deploy role (default CDKToolkit)"},
+    {"flag": "--no-cdk", "dest": "no_cdk", "flag_only": true, "help": "leave the CDK bootstrap alone (no cdk deploy then)"}
+  ],
+  "steps": [
+    {"id": "helper", "what": "AWS signing helper",
+     "why": "AWS's official aws_signing_helper trades the certificate for 1-hour credentials.",
+     "risk": "a binary from rolesanywhere.amazonaws.com, at a pinned version, refused unless its SHA-256 is the one AWS publishes."},
+    {"id": "certificate", "what": "Certificate authority and the agent's certificate",
+     "why": "The agent's identity: the CA is made once per machine, the certificate (CN = the agent's name) is valid one year and renewed by running this again.",
+     "risk": "the private keys stay in ~/.config/briefling-agent (mode 600), never in the sandbox: whoever reads them gets the agent's AWS access."},
+    {"id": "stack", "what": "AWS stack {prefix}{name}",
+     "why": "A trust anchor for the CA, a 1-hour profile, a read role (ReadOnlyAccess without secret values) and a deploy role that may only enter the CDK bootstrap roles.",
+     "risk": "creates IAM roles in the account with your admin profile; the stack and its names say {prefix}{name}."},
+    {"id": "cdk", "what": "CDK bootstrap ({toolkit_stack}): sts:SetSourceIdentity",
+     "why": "Roles Anywhere carries the agent's name (source identity) through every role it enters: the CDK roles must accept it, else cdk deploy is refused.",
+     "risk": "changes the trust of the bootstrap roles towards this account only; the change set is shown and refused if it replaces anything. A later standard `cdk bootstrap` removes it: run this again."}
+  ],
+  "service": {
+    "what": "Credentials service on 127.0.0.1:{port}",
+    "why": "aws_signing_helper serve hands out the 1-hour credentials like an EC2 instance's metadata endpoint, renewed before they expire.",
+    "risk": "it has no password: any program of this machine can read the agent's 1-hour credentials on that port.",
+    "argv": ["{helper}", "serve", "--port", "{port}", "--certificate", "{cert}", "--private-key", "{key}",
+             "--trust-anchor-arn", "{TrustAnchorArn}", "--profile-arn", "{ProfileArn}", "--role-arn", "{ReadRoleArn}"]
+  },
+  "vm": {
+    "what": "AWS in the sandbox",
+    "why": "The sandbox's commands find the credentials service (default = the read role), and a `deploy` profile for cdk deploy.",
+    "blocks": [
+      {"path": "/etc/sandbox-persistent.sh", "user": "root",
+       "lines": ["export AWS_EC2_METADATA_SERVICE_ENDPOINT=http://host.docker.internal:{port}/", "export AWS_REGION={region}"]},
+      {"path": "$HOME/.aws/config", "user": "agent",
+       "lines": ["[profile deploy]", "role_arn = {DeployRoleArn}", "credential_source = Ec2InstanceMetadata",
+                 "region = {region}"]}
+    ],
+    "needs": {"argv": ["sh", "-c", "command -v aws"],
+              "install": ["sh", "-c", "set -e; cd /tmp; curl -fsSL -o awscliv2.zip \"https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip\"; unzip -q -o awscliv2.zip; sudo ./aws/install --update; rm -rf aws awscliv2.zip"],
+              "what": "AWS CLI v2 in the sandbox"}
+  },
+  "check": {"argv": ["bash", "-c", "aws sts get-caller-identity --query Arn --output text"], "expect": "{prefix}{name}-read"}
+}

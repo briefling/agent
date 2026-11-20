@@ -2,6 +2,7 @@
 
     briefling-agent init claude "<invitation link>"   sandbox, login, bridge, service: everything, once
     briefling-agent start | stop | status | logs [-f]  the service afterwards
+    briefling-agent ext list | add | revoke | remove   extensions (e.g. AWS access), see extensions/__init__.py
 
 Each step of `init` says what it does before doing it, and is skipped when already done, so `init` can be run again
 (after a failed step, or with --force to join again). Nothing runs without a sandbox: without Docker Sandboxes (`sbx`)
@@ -25,7 +26,44 @@ import sys
 import time
 from typing import Dict, List, Optional
 
-from . import __version__, service
+from . import __version__, extensions, service
+
+
+# ---- network rules of a sandbox ----
+
+def sandbox_exists(conf: Dict[str, object]) -> bool:
+    sbx = str(conf.get("sbx") or "")
+    return bool(sbx) and os.path.exists(sbx) and str(conf.get("sandbox")) in sandboxes(sbx)
+
+
+def port_allowed(sbx: str, sandbox: str, port: int) -> bool:
+    """`sbx policy ls` (0.54) prints one summary line per policy (« allow 198 hosts… »): the resources, hence
+    `localhost:<port>`, only show with --wide. Matched as a whole resource (50861 is not 508610)."""
+    out = run([sbx, "policy", "ls", "--wide", sandbox], check=False).stdout
+    return re.search(r"(?<![\w.-])localhost:%d(?![\w.-])" % port, out) is not None
+
+
+def allow_port(sbx: str, sandbox: str, port: int) -> None:
+    rule = f"localhost:{port}"
+    if port_allowed(sbx, sandbox, port):
+        say("  already allowed.")
+    else:
+        run([sbx, "policy", "allow", "network", "--sandbox", sandbox, rule])
+        say(f"  allowed {rule} for {sandbox}.")
+
+
+def unallow_port(sbx: str, sandbox: str, port: int) -> None:
+    """--force: sbx asks for a confirmation, and refuses outside a terminal without it. --sandbox, not positional
+    (sbx 0.54: « the sandbox name is no longer positional »)."""
+    rule = f"localhost:{port}"
+    if not port_allowed(sbx, sandbox, port):
+        return
+    p = run([sbx, "policy", "rm", "network", "--sandbox", sandbox, "--resource", rule, "--force"], check=False)
+    if port_allowed(sbx, sandbox, port):
+        say(f"  the network rule {rule} is still there ({p.stdout.strip()[-300:]}): `sbx policy ls --wide "
+            f"{sandbox}`, then `sbx policy rm network --sandbox {sandbox} --resource {rule} --force`.")
+    else:
+        say(f"  network rule {rule} removed.")
 
 BRIDGE_REPO = "https://github.com/briefling/acp-bridge"
 BRIDGE_DIST = "briefling-acp-bridge"
@@ -42,6 +80,11 @@ AGENTS: Dict[str, Dict[str, object]] = {
         "workload": "claude",
         "kits": ["sbx/claude-acp:latest", "sbx/claude-sessions:1.0.0"],
         "acp": ["claude-agent-acp"],
+        "skills": "/home/agent/.claude/skills",
+        # sbx/claude-sessions' host-mount@1 path. Its host folder, chosen by sbx, is ONE per kit: every sandbox of
+        # the machine mounts it whole (a subfolder per sandbox is the hook's convention, not a boundary), so two
+        # agents read each other's conversations and memory (seen on a real Mac). Each agent gets its own folder.
+        "history": "/home/agent/claude-history",  # where --skills-dir is mounted (the agent writes its skills there)
         # /login stores the subscription's tokens on the host; the VM gets placeholders in this file.
         "logged_in": 'test -s "$HOME/.claude/.credentials.json"',
         "login_help": "Claude Code opens: type /login, finish the login in your browser, then type /exit.",
@@ -278,21 +321,42 @@ def cmd_init(a: argparse.Namespace) -> int:
 
     workspace = os.path.abspath(os.path.expanduser(a.workspace or str(conf.get("workspace") or
                                                    os.path.join(home(), "briefling-agent", name))))
-    conf = {**conf, "name": name, "agent": a.agent, "sandbox": str(conf.get("sandbox") or f"briefling-{name}"),
+    skills = os.path.abspath(os.path.expanduser(a.skills_dir)) if a.skills_dir else conf.get("skills_dir")
+    if a.skills_dir and skills != conf.get("skills_dir") and sandbox_exists(conf):
+        raise Fail(f"the sandbox mounts {conf.get('skills_dir') or 'sbx shared store'} as its skills: a mount is "
+                   "set at creation, so "
+                   f"`sbx rm {conf['sandbox']}` first (its sessions and login stay on this machine), then init again")
+    conf = {**conf, "name": name, "skills_dir": skills, "agent": a.agent, "sandbox": str(conf.get("sandbox") or f"briefling-{name}"),
             "workspace": workspace, "port": int(a.port or conf.get("port") or free_port()), "sbx": sbx,
             "bridge": bridge, "env": env, "log": os.path.join(adir, "bridge.log"),
             "path": os.environ.get("PATH", "/usr/bin:/bin")}
     save_conf(conf)
     sandbox = str(conf["sandbox"])
 
-    step(f"Sandbox {sandbox}", f"A microVM for the agent. It sees {workspace} (its working folder) and nothing "
-         "else of this machine; its network goes through Docker's filtering proxy.")
+    step(f"Sandbox {sandbox}", f"A microVM for the agent. It sees {workspace} (its working folder)"
+         + (f" and {skills} (its skills, read and written)" if skills else "") + " and nothing else of this machine; "
+         "its network goes through Docker's filtering proxy.")
     os.makedirs(workspace, exist_ok=True)  # also when the sandbox exists: the bridge starts its sessions there
     if sandbox in sandboxes(sbx):
         say("  already there.")
+        if not conf.get("history_dir"):
+            say(f"  WARNING: made without a history folder of its own, it mounts sbx's history folder shared by every "
+                f"sandbox (the other agents' conversations). Move its sessions out (`sbx inspect {sandbox}` shows the "
+                f"folder), `sbx rm {sandbox}`, then init again: it gets a folder of its own.")
     else:
         kits = [x for k in agent["kits"] for x in ("--kit", k)]  # type: ignore[union-attr]
-        run([sbx, "create", "--name", sandbox, *kits, str(agent["workload"]), workspace])
+        history = os.path.join(adir, "claude-history")
+        os.makedirs(history, mode=0o700, exist_ok=True)
+        mounts = ["--mount", f"{history}:{agent['history']}"]
+        conf["history_dir"] = history
+        save_conf(conf)
+        if skills:
+            # --skills off: no shared read-only store over the folder (sbx's default), which would refuse the
+            # agent's writes and show its skills to every sandbox
+            os.makedirs(str(skills), mode=0o700, exist_ok=True)
+            mounts += ["--skills", "off"]
+        run([sbx, "create", "--name", sandbox, *mounts, *kits, str(agent["workload"]), workspace]
+            + ([f"{skills}:{agent['skills']}"] if skills else []))
         say("  created.")
 
     step("Agent login", "Once. The real tokens stay on this machine; the sandbox only gets placeholders.")
@@ -312,12 +376,7 @@ def cmd_init(a: argparse.Namespace) -> int:
     step(f"Network: port {port} for this sandbox only",
          f"The bridge serves briefling's tools on 127.0.0.1:{port} (a token per conversation). The sandbox may reach "
          "that one port of this machine, no other.")
-    rule = f"localhost:{port}"
-    if rule in run([sbx, "policy", "ls", sandbox], check=False).stdout:
-        say("  already allowed.")
-    else:
-        run([sbx, "policy", "allow", "network", "--sandbox", sandbox, rule])
-        say(f"  allowed {rule} for {sandbox}.")
+    allow_port(sbx, sandbox, port)
 
     log = str(conf["log"])
     if a.link and (a.force or not os.path.exists(env)):
@@ -394,6 +453,8 @@ def cmd_status(a: argparse.Namespace) -> int:
              if "connected to the hub" in ln or " ERROR " in ln or " WARNING " in ln]
     if lines:
         say(f"last       {lines[-1]}")
+    for line in extensions.status_lines(sys.modules[__name__], conf):
+        say(line)
     return 0 if state in ("running", "active") else 3
 
 
@@ -422,6 +483,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     i.add_argument("--workspace", help="the folder the agent works in (default ~/briefling-agent/<name>)")
     i.add_argument("--port", type=int, help="local port of briefling's tools (default: a free one)")
     i.add_argument("--force", action="store_true", help="join again with a new link")
+    i.add_argument("--skills-dir", help="a folder of this machine for the agent's own skills, mounted read-write "
+                   "(default: sbx's shared store, read-only); set when the sandbox is created")
     for c, h in (("start", "start the service"), ("stop", "stop the service (and keep it stopped at login)"),
                  ("status", "show the service, sandbox and bridge"), ("logs", "show the bridge's log")):
         s = sub.add_parser(c, help=h)
@@ -429,8 +492,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         if c == "logs":
             s.add_argument("-f", "--follow", action="store_true")
             s.add_argument("-n", "--lines", type=int, default=40)
+    extensions.add_parsers(sub)
     a = p.parse_args(argv)
     try:
+        if a.cmd == "ext":
+            return extensions.main(sys.modules[__name__], a)
         return {"init": cmd_init, "start": cmd_start, "stop": cmd_stop, "status": cmd_status,
                 "logs": cmd_logs}[a.cmd](a)
     except Fail as e:

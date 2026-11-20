@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import plistlib
 import subprocess
+import time
 from typing import List, Optional, Tuple
 
 THROTTLE_S = 30
@@ -15,6 +16,9 @@ THROTTLE_S = 30
 
 def label(name: str) -> str:
     return f"briefling-agent.{name}"
+
+
+BOOTOUT_WAIT_S, BOOTSTRAP_TRIES = 10, 3
 
 
 def _run(argv: List[str]) -> Tuple[int, str]:
@@ -51,11 +55,27 @@ class Launchd:
     def installed(self) -> bool:
         return os.path.exists(self.path)
 
+    def uninstall(self) -> None:
+        self.stop()
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
     def start(self) -> Optional[str]:
-        _run(["launchctl", "enable", f"{self.domain}/{self.label}"])
-        _run(["launchctl", "bootout", f"{self.domain}/{self.label}"])  # a loaded job must be unloaded to reload
-        rc, out = _run(["launchctl", "bootstrap", self.domain, self.path])
-        return None if rc == 0 else out.strip() or f"launchctl bootstrap exited {rc}"
+        target = f"{self.domain}/{self.label}"
+        _run(["launchctl", "enable", target])
+        _run(["launchctl", "bootout", target])  # a loaded job must be unloaded to reload
+        # bootout returns before the job is gone: a bootstrap right after fails with « 5: Input/output error »
+        # (seen on a real Mac). Wait for it to go, then retry a few times anyway.
+        deadline = time.monotonic() + BOOTOUT_WAIT_S
+        while _run(["launchctl", "print", target])[0] == 0 and time.monotonic() < deadline:
+            time.sleep(0.2)
+        rc, out = 1, ""
+        for i in range(BOOTSTRAP_TRIES):
+            rc, out = _run(["launchctl", "bootstrap", self.domain, self.path])
+            if rc == 0:
+                return None
+            time.sleep(1 + i)
+        return out.strip() or f"launchctl bootstrap exited {rc}"
 
     def stop(self) -> Optional[str]:
         # disable: a stopped agent stays stopped at the next login, like `systemctl --user disable --now`
@@ -91,7 +111,7 @@ class Systemd:
     def render(self, argv: List[str], log: str, path_env: str) -> str:
         return "\n".join([
             "[Unit]",
-            f"Description=briefling agent {self.name} (ACP bridge + Docker Sandboxes)",
+            f"Description=briefling agent {self.name}" + ("" if "." in self.name else " (ACP bridge + Docker Sandboxes)"),
             "",
             "[Service]",
             "ExecStart=" + " ".join(self._quote(a) for a in argv),
@@ -114,6 +134,12 @@ class Systemd:
 
     def installed(self) -> bool:
         return os.path.exists(self.path)
+
+    def uninstall(self) -> None:
+        self.stop()
+        if os.path.exists(self.path):
+            os.remove(self.path)
+            _run(["systemctl", "--user", "daemon-reload"])
 
     def start(self) -> Optional[str]:
         rc, out = _run(["systemctl", "--user", "enable", "--now", self.unit])

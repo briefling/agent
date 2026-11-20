@@ -1,0 +1,116 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "briefling-agent: IAM Roles Anywhere access for one agent (a read-only role, a deploy role reached from it)",
+  "Parameters": {
+    "Prefix": {"Type": "String", "AllowedPattern": "^[a-z0-9-]{0,24}$"},
+    "AgentName": {"Type": "String", "AllowedPattern": "^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$"},
+    "CaCertificate": {"Type": "String", "Description": "PEM of the certificate authority that signs the agent's certificate"}
+  },
+  "Resources": {
+    "Anchor": {
+      "Type": "AWS::RolesAnywhere::TrustAnchor",
+      "Properties": {
+        "Name": {"Fn::Sub": "${Prefix}${AgentName}-ca"},
+        "Enabled": true,
+        "Source": {"SourceType": "CERTIFICATE_BUNDLE", "SourceData": {"X509CertificateData": {"Ref": "CaCertificate"}}}
+      }
+    },
+    "ReadRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {"Fn::Sub": "${Prefix}${AgentName}-read"},
+        "MaxSessionDuration": 3600,
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": "rolesanywhere.amazonaws.com"},
+            "Action": ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity"],
+            "Condition": {
+              "ArnEquals": {"aws:SourceArn": {"Fn::GetAtt": ["Anchor", "TrustAnchorArn"]}},
+              "StringEquals": {"aws:PrincipalTag/x509Subject/CN": {"Ref": "AgentName"}}
+            }
+          }]
+        },
+        "ManagedPolicyArns": ["arn:aws:iam::aws:policy/ReadOnlyAccess"],
+        "Policies": [
+          {
+            "PolicyName": "deny-secrets",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "NoSecretValues",
+                  "Effect": "Deny",
+                  "Action": ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath", "ssm:GetParameterHistory",
+                             "secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue", "kms:Decrypt"],
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "NoSecretsInConfig",
+                  "Effect": "Deny",
+                  "Action": ["lambda:GetFunction", "lambda:GetFunctionConfiguration", "lambda:ListFunctions",
+                             "ecs:DescribeTaskDefinition", "ec2:DescribeLaunchTemplateVersions",
+                             "ec2:DescribeInstanceAttribute"],
+                  "Resource": "*"
+                }
+              ]
+            }
+          },
+          {
+            "PolicyName": "may-assume-deploy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [{
+                "Effect": "Allow",
+                "Action": ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity"],
+                "Resource": {"Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Prefix}${AgentName}-deploy"}
+              }]
+            }
+          }
+        ]
+      }
+    },
+    "DeployRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {"Fn::Sub": "${Prefix}${AgentName}-deploy"},
+        "MaxSessionDuration": 3600,
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"AWS": {"Fn::GetAtt": ["ReadRole", "Arn"]}},
+            "Action": ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity"]
+          }]
+        },
+        "Policies": [{
+          "PolicyName": "cdk-deploy-only",
+          "PolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Action": ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity"],
+              "Resource": {"Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cdk-*"}
+            }]
+          }
+        }]
+      }
+    },
+    "Profile": {
+      "Type": "AWS::RolesAnywhere::Profile",
+      "Properties": {
+        "Name": {"Fn::Sub": "${Prefix}${AgentName}"},
+        "Enabled": true,
+        "DurationSeconds": 3600,
+        "RoleArns": [{"Fn::GetAtt": ["ReadRole", "Arn"]}]
+      }
+    }
+  },
+  "Outputs": {
+    "TrustAnchorArn": {"Value": {"Fn::GetAtt": ["Anchor", "TrustAnchorArn"]}},
+    "ProfileArn": {"Value": {"Fn::GetAtt": ["Profile", "ProfileArn"]}},
+    "ReadRoleArn": {"Value": {"Fn::GetAtt": ["ReadRole", "Arn"]}},
+    "DeployRoleArn": {"Value": {"Fn::GetAtt": ["DeployRole", "Arn"]}}
+  }
+}
