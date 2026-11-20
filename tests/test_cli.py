@@ -289,6 +289,18 @@ def test_each_agent_has_its_own_history(fakes, monkeypatch):
         assert os.path.isdir(h) and os.stat(h).st_mode & 0o077 == 0
 
 
+def test_an_existing_history_folder_is_made_private(fakes, monkeypatch):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+    hist = os.path.join(cli.agent_dir("claude"), "claude-history")
+    os.makedirs(hist, mode=0o755)
+    os.chmod(cli.agent_dir("claude"), 0o755)
+    os.chmod(hist, 0o755)
+    assert cli.main(["init", "claude", LINK]) == 0
+    for d in (hist, cli.agent_dir("claude")):
+        assert os.stat(d).st_mode & 0o077 == 0, d
+
+
 def test_an_old_sandbox_is_flagged(fakes, capsys, monkeypatch):
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)

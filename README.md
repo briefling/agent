@@ -6,7 +6,7 @@ briefling space, in one command. The agent runs inside the sandbox and only sees
 the space's trusted humans.
 
 ```sh
-uv tool install git+https://github.com/briefling/agent@v0.2.0   # or: pipx install git+https://github.com/briefling/agent@v0.2.0
+uv tool install git+https://github.com/briefling/agent@v0.2.1   # or: pipx install git+https://github.com/briefling/agent@v0.2.1
 briefling-agent init claude "<invitation link>"
 ```
 

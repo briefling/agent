@@ -31,6 +31,13 @@ from . import __version__, extensions, service
 
 # ---- network rules of a sandbox ----
 
+def private_dir(path: str) -> None:
+    """Mode 700 even when it exists: makedirs' mode only applies to a folder it makes (a history folder made
+    beforehand came out 755 in a real run, readable by every account)."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
 def sandbox_exists(conf: Dict[str, object]) -> bool:
     sbx = str(conf.get("sbx") or "")
     return bool(sbx) and os.path.exists(sbx) and str(conf.get("sandbox")) in sandboxes(sbx)
@@ -144,7 +151,7 @@ def load_conf(name: str) -> Dict[str, object]:
 
 
 def save_conf(conf: Dict[str, object]) -> None:
-    os.makedirs(agent_dir(str(conf["name"])), mode=0o700, exist_ok=True)
+    private_dir(agent_dir(str(conf["name"])))
     tmp = conf_path(str(conf["name"])) + ".tmp"
     with open(tmp, "w") as f:
         json.dump(conf, f, indent=2)
@@ -307,7 +314,7 @@ def cmd_init(a: argparse.Namespace) -> int:
         raise Fail(f"agent {name!r} already exists as {conf.get('agent')!r}: pick another --name")
     agent = AGENTS[a.agent]
     adir = agent_dir(name)
-    os.makedirs(adir, mode=0o700, exist_ok=True)
+    private_dir(adir)
     env = os.path.join(adir, "bridge.env")
     if not os.path.exists(env) and not a.link:
         raise Fail('the first init needs the invitation link: briefling-agent init claude "<invitation link>"')
@@ -346,7 +353,7 @@ def cmd_init(a: argparse.Namespace) -> int:
     else:
         kits = [x for k in agent["kits"] for x in ("--kit", k)]  # type: ignore[union-attr]
         history = os.path.join(adir, "claude-history")
-        os.makedirs(history, mode=0o700, exist_ok=True)
+        private_dir(history)
         mounts = ["--mount", f"{history}:{agent['history']}"]
         conf["history_dir"] = history
         save_conf(conf)

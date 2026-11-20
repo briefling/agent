@@ -97,7 +97,7 @@ class Ctx:
         self.name, self.sandbox, self.sbx = str(conf["name"]), str(conf["sandbox"]), str(conf["sbx"])
         self.state: Dict[str, object] = dict((conf.get("extensions") or {}).get(ext) or {})  # type: ignore[union-attr]
         self.dir = os.path.join(cli.agent_dir(self.name), ext)
-        os.makedirs(self.dir, mode=0o700, exist_ok=True)
+        self.cli.private_dir(self.dir)
         self.say, self.run, self.Fail = cli.say, cli.run, cli.Fail
 
     def vars(self) -> Dict[str, object]:
